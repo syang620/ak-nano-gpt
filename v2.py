@@ -12,6 +12,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embed = 32 # embedding dimension
 dropout = 0.2
+n_layer = 4
+n_head = 4
 # ------------
 
 torch.manual_seed(1337)
@@ -59,6 +61,22 @@ def estimate_loss():
     model.train()
     return out
 
+class LayerNorm1d:
+    def __init__(self, dim, eps = 1e-5, momentum = 0.1):
+        self.eps = eps
+        self.gamma = torch.ones(dim)
+        self.beta = torch.zeros(dim)
+
+    def __call__(self, x):
+        xmean = x.mean(1, keepdim=True)
+        xvar = x.var(1, keepdim = True)
+        xhat = (x-xmean)/torch.sqrt(xvar + self.eps)
+        self.out = self.gamma * xhat + self.beta
+        return self.out
+
+    def paramter(self):
+        return [self.gamma, self.beta]
+        
 # self-attention head
 class Head(nn.Module):
     def __init__(self, head_size):
@@ -67,6 +85,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embed, head_size, bias = False)
         self.value = nn.Linear(n_embed, head_size, bias = False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B,T,C = x.shape
@@ -78,6 +97,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5 #(B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T]==0, float('-inf'))
         wei = F.softmax(wei, dim=-1) #(B, T, T)
+        wei = self.dropout(wei)
         # weighted aggregation
         v = self.value(x)
         out = wei @ v #(B, T, T) @ (B, T, C) --> (B, T, C)
@@ -88,12 +108,13 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_head, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_head)])
-        # self.proj = nn.Linear(n_embed, n_embed)
-        # self.dropout = nn.Dropout(dropout)
+        self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.concat([h(x) for h in self.heads], dim=-1)
-        # out = self.dropout(self.proj(out))
+        # out = self.proj(out)
+        out = self.dropout(self.proj(out))
         return out
         
 class FeedForward(nn.Module):
@@ -101,14 +122,28 @@ class FeedForward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embed, 4 * n_embed),
-            nn.Relu(),
-            # nn.Linear(4*n_embed, n_embed),
-            # nn.Dropout(dropout)
+            nn.ReLU(),
+            nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(dropout)
         )
     def forward(self, x):
         return self.net(x)
-        
 
+class Block(nn.Module):
+    def __init__(self, n_embed, n_head):
+        super().__init__()
+        head_size = n_embed // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embed)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+        
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+        
 # super simple bigram model
 class BigramLanguageModel(nn.Module):
 
@@ -119,9 +154,11 @@ class BigramLanguageModel(nn.Module):
 
         # position_embedding: each position from 0 to block_size-1 will get its own embedding vector
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head) for _ in range(n_layer)])
         # self.sa_head = Head(n_embed)
-        self.sa_heads = MultiHeadAttention(4, n_embed//4)
-        self.ffwd = FeedForward(n_embed)
+        # self.sa_heads = MultiHeadAttention(4, n_embed//4)
+        self.ln_f = nn.LayerNorm(n_embed)
+        # self.ffwd = FeedForward(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
         
     def forward(self, idx, targets=None):
@@ -131,8 +168,10 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device = device)) #(T, C)
         x = tok_emb + pos_emb #right-aligned, new dimension added and broadcasted across batch
-        x = self.sa_heads(x)
-        x = self.ffwd(x)
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        # x = self.sa_heads(x)
+        # x = self.ffwd(x)
         logits = self.lm_head(x) # (B,T,vocab_size)
 
         if targets is None:
